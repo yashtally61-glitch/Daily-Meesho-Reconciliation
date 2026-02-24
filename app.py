@@ -41,22 +41,55 @@ def detect_account(filename):
     return "Unknown", "UNK"
 
 # ─────────────────────────────────────────────
-# SIZE RANGE MAP
-# Single size → possible range keys in PWN
+# SIZE NORMALIZATION
+# Convert Meesho size formats → OMS size formats
+# ─────────────────────────────────────────────
+SIZE_NORMALIZE = {
+    'FREE-SIZE: 36-40': 'F',
+    'FREE-SIZE: 28-32': 'F',
+    'FREE-SIZE: 32-36': 'F',
+    'FREE-SIZE: 40-44': 'F',
+    'FREE SIZE':        'F',
+    'FREE':             'F',
+    'FREESIZE':         'F',
+    'XXXL':             '3XL',
+    'XXXXL':            '4XL',
+    'XXXXXL':           '5XL',
+}
+
+def normalize_size(size):
+    """Normalize Meesho size to OMS size format."""
+    s = size.strip().upper()
+    return SIZE_NORMALIZE.get(s, size.strip())
+
+# ─────────────────────────────────────────────
+# SIZE RANGE MAP — single size → PWN range keys
 # ─────────────────────────────────────────────
 SIZE_RANGE_MAP = {
-    'S':   ['S-M',      'XS-S'],
-    'M':   ['S-M',      'M-L'],
-    'L':   ['L-XL',     'M-L'],
-    'XL':  ['L-XL',     'XL-XXL'],
-    'XXL': ['XXL-3XL',  'XL-XXL'],
-    '3XL': ['XXL-3XL',  '3XL-4XL'],
-    '4XL': ['4XL-5XL',  '3XL-4XL'],
-    '5XL': ['4XL-5XL',  '5XL-6XL'],
-    '6XL': ['6XL-7XL',  '5XL-6XL'],
-    '7XL': ['6XL-7XL',  '7XL-8XL'],
+    'S':   ['S-M', 'XS-S'],
+    'M':   ['S-M', 'M-L'],
+    'L':   ['L-XL', 'M-L'],
+    'XL':  ['L-XL', 'XL-XXL'],
+    'XXL': ['XXL-3XL', 'XL-XXL'],
+    '3XL': ['XXL-3XL', '3XL-4XL'],
+    '4XL': ['4XL-5XL', '3XL-4XL'],
+    '5XL': ['4XL-5XL', '5XL-6XL'],
+    '6XL': ['6XL-7XL', '5XL-6XL'],
+    '7XL': ['6XL-7XL', '7XL-8XL'],
     '8XL': ['7XL-8XL'],
+    'F':   ['F'],
 }
+
+# ─────────────────────────────────────────────
+# PREFIX REPLACEMENTS — tried one by one
+# ─────────────────────────────────────────────
+PREFIX_REPLACEMENTS = [
+    (r'YKN',      'YK'),
+    (r'YKO251',   'YK251'),
+    (r'YPLK',     'YK'),
+    (r'PLYK',     'YK'),
+    (r'YK-(\d)',  r'YK\1'),   # YK-251 → YK251
+]
 
 # ─────────────────────────────────────────────
 # LOAD REFERENCE FILES
@@ -85,11 +118,11 @@ def load_replace_sku(file_bytes):
 
 @st.cache_data
 def load_pwn(file_bytes):
-    # Row 1: section headers, Row 2: person names, Row 3: real column headers
+    # Row 3 is the real header: OMS Parent SKU | OMS Child SKU | PWN+10%
+    # MUST use OMS Child SKU (col 1) — NOT Parent SKU (col 0)
     df = pd.read_excel(io.BytesIO(file_bytes), header=2)
     df.columns = [str(c).strip() for c in df.columns]
 
-    # MUST use Child SKU column (has sizes), NOT Parent SKU
     child_col = next((c for c in df.columns if "CHILD" in c.upper()), df.columns[1])
     pwn_col   = next((c for c in df.columns if "PWN"   in c.upper()), df.columns[2])
 
@@ -98,11 +131,9 @@ def load_pwn(file_bytes):
     df[pwn_col]   = pd.to_numeric(df[pwn_col], errors="coerce")
     df = df.dropna(subset=[pwn_col])
 
-    # Build TWO maps:
-    # 1. exact (original case) for speed
-    # 2. lowercase -> (original, price) for case-insensitive fallback
     exact_map = df.set_index(child_col)[pwn_col].to_dict()
-    ci_map    = {k.lower(): (k, v) for k, v in exact_map.items()}
+    # Case-insensitive map: lowercase key → (original_key, price)
+    ci_map = {k.lower(): (k, v) for k, v in exact_map.items()}
     return exact_map, ci_map
 
 @st.cache_data
@@ -123,72 +154,55 @@ def load_closed_sku(file_bytes):
 
     add_prices("Sheet1", 0, 1)
     add_prices("Sheet2", 0, 1)
-    # Take minimum price across both sheets
+    # Use minimum price across both sheets
     return {sku: min(prices) for sku, prices in closed.items() if prices}
 
 # ─────────────────────────────────────────────
 # FULL PWN LOOKUP WITH ALL FALLBACKS
-# Order of resolution:
-#   1. Exact match
+#
+# Resolution order for each OMS SKU:
+#   1. Direct exact match
 #   2. Case-insensitive match
-#   3. Remove extra hyphen: YK-251 → YK251
-#   4. Combined OMS size → split: 3XL-4XL → try 3XL, 4XL separately
-#   5. Single size → size-range key: L → L-XL
-#   6. Prefix replacements: YKN→YK, YKO251→YK251, PLYK→YK, YPLK→YK, YK-→YK
+#   3. Prefix replacements (YKN→YK, PLYK→YK, YK-251→YK251, etc.)
+#   4. Split combined size (BASE-3XL-4XL → try BASE-3XL, BASE-4XL)
+#   5. Size-range match (BASE-L → BASE-L-XL, BASE-XXL → BASE-XXL-3XL, etc.)
 # ─────────────────────────────────────────────
-PREFIX_REPLACEMENTS = [
-    (r'YKN',    'YK'),
-    (r'YKO251', 'YK251'),
-    (r'YPLK',   'YK'),
-    (r'PLYK',   'YK'),
-    (r'YK-(\d)','YK\\1'),   # YK-251 → YK251 (hyphen before digit)
-]
-
 def lookup_pwn(oms_sku, exact_map, ci_map):
-    """
-    Try every resolution strategy in order.
-    Returns (price, matched_key, note) or (None, oms_sku, 'Not Found')
-    """
-    # ── 1. Exact match ──
-    if oms_sku in exact_map:
-        return exact_map[oms_sku], oms_sku, "Direct"
+    """Returns (price, matched_key, note) or (None, oms_sku, 'Not Found')"""
 
-    # ── 2. Case-insensitive ──
-    ci_key = oms_sku.lower()
-    if ci_key in ci_map:
-        return ci_map[ci_key][1], ci_map[ci_key][0], "Case fix"
+    def try_key(key, note):
+        if key in exact_map:
+            return exact_map[key], key, note
+        if key.lower() in ci_map:
+            return ci_map[key.lower()][1], ci_map[key.lower()][0], note + "(ci)"
+        return None, None, None
 
-    # ── 3. Prefix replacements (one by one, both exact + CI after each) ──
+    # 1. Direct
+    p, k, n = try_key(oms_sku, "Direct")
+    if p is not None: return p, k, n
+
+    # 2. Prefix replacements — one by one
     for pattern, repl in PREFIX_REPLACEMENTS:
         candidate = re.sub(pattern, repl, oms_sku, count=1)
-        if candidate == oms_sku:
-            continue
-        if candidate in exact_map:
-            return exact_map[candidate], candidate, f"Prefix: {pattern}→{repl}"
-        if candidate.lower() in ci_map:
-            return ci_map[candidate.lower()][1], ci_map[candidate.lower()][0], f"Prefix+Case: {pattern}→{repl}"
+        if candidate != oms_sku:
+            p, k, n = try_key(candidate, f"Prefix:{pattern}→{repl}")
+            if p is not None: return p, k, n
 
-    # ── 4. OMS combined size split: BASE-3XL-4XL → try BASE-3XL, BASE-4XL ──
+    # 3. Combined OMS size split: BASE-3XL-4XL → try BASE-3XL, BASE-4XL
     m = re.match(r'^(.+)-([A-Z0-9]+)-([A-Z0-9]+)$', oms_sku)
     if m:
         base, s1, s2 = m.group(1), m.group(2), m.group(3)
         for sz in [s1, s2]:
-            cand = f"{base}-{sz}"
-            if cand in exact_map:
-                return exact_map[cand], cand, f"Split size: {s1}-{s2}→{sz}"
-            if cand.lower() in ci_map:
-                return ci_map[cand.lower()][1], ci_map[cand.lower()][0], f"Split+Case: →{sz}"
+            p, k, n = try_key(f"{base}-{sz}", f"Split→{sz}")
+            if p is not None: return p, k, n
 
-    # ── 5. Single size → size-range key: BASE-L → BASE-L-XL ──
-    m = re.match(r'^(.+)-([A-Z0-9]+)$', oms_sku)
-    if m:
-        base, size = m.group(1), m.group(2)
-        for range_size in SIZE_RANGE_MAP.get(size, []):
-            cand = f"{base}-{range_size}"
-            if cand in exact_map:
-                return exact_map[cand], cand, f"Size range: {size}→{range_size}"
-            if cand.lower() in ci_map:
-                return ci_map[cand.lower()][1], ci_map[cand.lower()][0], f"Size range+Case: {size}→{range_size}"
+    # 4. Single size → size-range key: BASE-L → BASE-L-XL
+    m2 = re.match(r'^(.+)-([A-Z0-9]+)$', oms_sku)
+    if m2:
+        base, size = m2.group(1), m2.group(2)
+        for range_sz in SIZE_RANGE_MAP.get(size, []):
+            p, k, n = try_key(f"{base}-{range_sz}", f"Range:{size}→{range_sz}")
+            if p is not None: return p, k, n
 
     return None, oms_sku, "Not Found"
 
@@ -213,14 +227,20 @@ def process_csv(df_raw, account_code, company_name, sku_map, exact_map, ci_map, 
         disc_price   = pd.to_numeric(row.get("Supplier Discounted Price (Incl GST and Commision)", 0), errors="coerce") or 0
         packet_id    = row.get("Packet Id", "")
 
-        # ── STEP 1: Build Meesho SKU = raw SKU + "-" + Size ──
+        # ── STEP 1: Build Meesho SKU = raw SKU + "-" + Size (original) ──
         size_clean = size if size and size.lower() not in ("nan", "", "none") else ""
         meesho_sku = f"{raw_sku}-{size_clean}" if size_clean else raw_sku
 
-        # ── STEP 2: Meesho SKU → OMS SKU via Replace_SKU map ──
-        oms_sku = acct_sku_map.get(meesho_sku, meesho_sku)
+        # ── STEP 2: Normalize size for OMS lookup ──
+        size_norm      = normalize_size(size_clean) if size_clean else ""
+        meesho_sku_norm = f"{raw_sku}-{size_norm}" if size_norm else raw_sku
 
-        # ── STEP 3: Check Closed SKU list ──
+        # ── STEP 3: Replace Meesho SKU → OMS SKU ──
+        # Try original size first, then normalized size
+        oms_sku = acct_sku_map.get(meesho_sku,
+                  acct_sku_map.get(meesho_sku_norm, meesho_sku_norm))
+
+        # ── STEP 4: Check Closed SKU list ──
         sku_status   = "On Going"
         pwn_10_price = None
         final_oms    = oms_sku
@@ -231,11 +251,11 @@ def process_csv(df_raw, account_code, company_name, sku_map, exact_map, ci_map, 
             pwn_10_price = closed_map[oms_sku]
             lookup_note  = "Closed SKU"
         else:
-            # ── STEP 4: Full PWN lookup with all fallbacks ──
+            # ── STEP 5: Full PWN lookup with all fallbacks ──
             pwn_val, final_oms, lookup_note = lookup_pwn(oms_sku, exact_map, ci_map)
             pwn_10_price = pwn_val if pwn_val is not None else "SKU Not Found"
 
-        # ── STEP 5: Calculate ──
+        # ── STEP 6: Calculate ──
         disc_price_qty = round(disc_price * qty, 2)
         if isinstance(pwn_10_price, (int, float)):
             pwn_10_qty = round(pwn_10_price * qty, 2)
@@ -345,7 +365,7 @@ def export_excel(sheets_dict):
         ws.freeze_panes    = "A2"
         ws.auto_filter.ref = ws.dimensions
 
-    # Summary sheet
+    # ── Summary Sheet ──
     ws_s        = wb.create_sheet(title="Summary", index=0)
     sum_headers = ["Account", "Company", "Total Orders", "Profit Orders",
                    "Loss Orders", "SKU Not Found", "Closed SKUs", "Total Difference (₹)"]
@@ -411,14 +431,15 @@ with st.sidebar:
     - 🟡 Yellow = SKU Not Found  
     """)
     st.markdown("---")
-    st.markdown("### 🔄 SKU Resolution Order")
+    st.markdown("### 🔄 SKU Resolution Steps")
     st.markdown("""
-    1. Direct match  
-    2. Case-insensitive  
-    3. Prefix fix (YKN/PLYK/YPLK→YK)  
-    4. Extra hyphen fix (YK-251→YK251)  
-    5. Combined size split (3XL-4XL→3XL)  
-    6. Size range (L→L-XL, XXL→XXL-3XL)  
+    1. Build Meesho SKU = SKU + `-` + Size  
+    2. Normalize: `Free-Size: 36-40` → `F`, `XXXL` → `3XL`  
+    3. Lookup in Replace SKU → OMS SKU  
+    4. Direct PWN lookup (exact + case-insensitive)  
+    5. Prefix fix: `PLYK/YKN/YPLK` → `YK`, `YK-251` → `YK251`  
+    6. Split combined size: `3XL-4XL` → `3XL`  
+    7. Size range: `L` → `L-XL`, `XXL` → `XXL-3XL`  
     """)
 
 # ─────────────────────────────────────────────
@@ -441,9 +462,9 @@ if st.button("🚀 Run Reconciliation", type="primary", use_container_width=True
         st.error(f"Please upload: {', '.join(errors)}")
     else:
         with st.spinner("Loading reference files..."):
-            sku_map              = load_replace_sku(ref_replace.read())
-            exact_map, ci_map    = load_pwn(ref_pwn.read())
-            closed_map           = load_closed_sku(ref_closed.read())
+            sku_map           = load_replace_sku(ref_replace.read())
+            exact_map, ci_map = load_pwn(ref_pwn.read())
+            closed_map        = load_closed_sku(ref_closed.read())
 
         st.success(
             f"✅ Reference loaded — **{len(exact_map):,} PWN Child SKUs** | "
@@ -480,9 +501,9 @@ if st.button("🚀 Run Reconciliation", type="primary", use_container_width=True
 
                 all_stats.append({
                     "account": account_code, "company": company_name,
-                    "orders": total_output,  "profit": profit_cnt,
-                    "loss": loss_cnt,        "not_found": not_found,
-                    "closed": closed_cnt,    "total_diff": total_diff
+                    "orders": total_output, "profit": profit_cnt,
+                    "loss": loss_cnt, "not_found": not_found,
+                    "closed": closed_cnt, "total_diff": total_diff
                 })
 
                 if total_input != total_output:
@@ -506,14 +527,13 @@ if st.button("🚀 Run Reconciliation", type="primary", use_container_width=True
                             unsafe_allow_html=True
                         )
 
-                # Show remaining not-found with lookup note for easy debugging
                 if not_found > 0:
-                    not_found_df = df_out[df_out["Difference Amount"] == "SKU Not Found"][
+                    nf_df = df_out[df_out["Difference Amount"] == "SKU Not Found"][
                         ["Meesho SKU", "OMS SKU", "Final OMS SKU", "Size", "Lookup Note"]
                     ].drop_duplicates()
-                    with st.expander(f"⚠️ {not_found} rows still SKU Not Found — click to see"):
-                        st.caption("These SKUs could not be found even after all fallback attempts. Add them to the PWN file.")
-                        st.dataframe(not_found_df, use_container_width=True)
+                    with st.expander(f"⚠️ {not_found} rows — SKU Not Found (click to inspect)"):
+                        st.caption("These SKUs were not found after all fallback attempts. Add them to the PWN file.")
+                        st.dataframe(nf_df, use_container_width=True)
 
                 with st.expander(f"👁️ Preview — {company_name} (first 20 rows)"):
                     st.dataframe(df_out.head(20), use_container_width=True)
