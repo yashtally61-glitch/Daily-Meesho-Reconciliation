@@ -28,21 +28,42 @@ st.markdown('<div class="main-title">🧾 Meesho Reconciliation Tool</div>', uns
 st.markdown('<div class="sub-title">Automated price reconciliation · YG · PE · AG accounts</div>', unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
+# HELPER — clean column names
+# Strips spaces AND surrounding single/double quotes
+# e.g. "'SELLER SKU'" → "SELLER SKU"
+# ─────────────────────────────────────────────
+def clean_col(c):
+    return str(c).strip().strip("'\"").strip()
+
+def find_col(df, *keywords):
+    """Find a column by checking if ANY keyword is in the cleaned column name (case-insensitive)."""
+    cleaned = {clean_col(c).upper(): c for c in df.columns}
+    for kw in keywords:
+        match = next((cleaned[k] for k in cleaned if kw.upper() in k), None)
+        if match:
+            return match
+    return None
+
+def clean_df_columns(df):
+    """Rename all columns to stripped/unquoted versions."""
+    df.columns = [clean_col(c) for c in df.columns]
+    return df
+
+# ─────────────────────────────────────────────
 # ACCOUNT DETECTION FROM FILENAME
 # ─────────────────────────────────────────────
 def detect_account(filename):
     fn = filename.upper()
-    if "_YG" in fn or fn.endswith("YG.CSV"):
-        return "Yash Gallery", "YG"
-    elif "_PE" in fn or fn.endswith("PE.CSV"):
-        return "Pushpa", "PE"
-    elif "_AG" in fn or fn.endswith("AG.CSV"):
-        return "Ashirwad Garments", "AG"
-    return "Unknown", "UNK"
+    if '_YG' in fn or fn.endswith('YG.CSV'):
+        return 'Yash Gallery', 'YG'
+    elif '_PE' in fn or fn.endswith('PE.CSV'):
+        return 'Pushpa', 'PE'
+    elif '_AG' in fn or fn.endswith('AG.CSV'):
+        return 'Ashirwad Garments', 'AG'
+    return 'Unknown', 'UNK'
 
 # ─────────────────────────────────────────────
 # SIZE NORMALIZATION
-# Meesho size → OMS size before replace map lookup
 # ─────────────────────────────────────────────
 SIZE_NORMALIZE = {
     'FREE-SIZE: 36-40': 'F',
@@ -61,7 +82,7 @@ def normalize_size(size):
     return SIZE_NORMALIZE.get(size.strip().upper(), size.strip())
 
 # ─────────────────────────────────────────────
-# SIZE RANGE MAP — single size → PWN range keys
+# SIZE RANGE MAP
 # ─────────────────────────────────────────────
 SIZE_RANGE_MAP = {
     'S':   ['S-M', 'XS-S'],
@@ -79,7 +100,7 @@ SIZE_RANGE_MAP = {
 }
 
 # ─────────────────────────────────────────────
-# PREFIX REPLACEMENTS for PWN fallback
+# PREFIX REPLACEMENTS
 # ─────────────────────────────────────────────
 PREFIX_REPLACEMENTS = [
     (r'YKN',     'YK'),
@@ -91,66 +112,62 @@ PREFIX_REPLACEMENTS = [
 
 # ─────────────────────────────────────────────
 # LOAD REFERENCE FILES
-# NOTE: bytes are read ONCE upfront before calling these functions
-#       to avoid Streamlit cache consuming empty byte streams
 # ─────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
-def load_replace_sku(yg_bytes, pe_bytes, ag_bytes):
+def load_replace_sku(file_bytes):
     """
-    Load each account's SKU map separately from pre-read bytes.
-    This avoids the bug where a single file's bytes get consumed
-    once and subsequent cache calls get empty bytes.
+    Load Replace SKU maps for all 3 accounts from one file.
+    Strips quotes and spaces from column names before matching.
     """
+    xl     = pd.ExcelFile(io.BytesIO(file_bytes))
     result = {}
 
-    # ── YG: Meesho YG sheet ──
-    xl_yg = pd.ExcelFile(io.BytesIO(yg_bytes))
-    if 'Meesho YG' in xl_yg.sheet_names:
-        df = xl_yg.parse('Meesho YG')
-        df['SELLER SKU'] = df['SELLER SKU'].astype(str).str.strip()
-        df['OMS SKU']    = df['OMS SKU'].astype(str).str.strip()
-        df = df.dropna(subset=['SELLER SKU', 'OMS SKU'])
-        df = df[df['SELLER SKU'] != 'nan']
-        result['YG'] = dict(zip(df['SELLER SKU'], df['OMS SKU']))
+    sheet_config = {
+        'Meesho YG':     ('YG',  ['SELLER', 'MEESHO', 'SKU'],  ['OMS']),
+        'Meesho Pushpa': ('PE',  ['MESSHO', 'MEESHO', 'SKU'],  ['OMS']),
+        'Messho Ag':     ('AG',  ['MESSHO', 'MEESHO', 'SKU'],  ['OMS']),
+    }
 
-    # ── PE: Meesho Pushpa sheet ──
-    xl_pe = pd.ExcelFile(io.BytesIO(pe_bytes))
-    if 'Meesho Pushpa' in xl_pe.sheet_names:
-        df = xl_pe.parse('Meesho Pushpa')
-        # find correct columns
-        mc = next((c for c in df.columns if 'MESSHO' in str(c).upper() or 'MEESHO' in str(c).upper()), None)
-        oc = next((c for c in df.columns if 'OMS' in str(c).upper()), None)
-        if mc and oc:
-            df[mc] = df[mc].astype(str).str.strip()
-            df[oc] = df[oc].astype(str).str.strip()
-            df = df.dropna(subset=[mc, oc])
-            df = df[df[mc] != 'nan']
-            result['PE'] = dict(zip(df[mc], df[oc]))
+    for sheet, (acct, src_kws, oms_kws) in sheet_config.items():
+        if sheet not in xl.sheet_names:
+            continue
+        df = xl.parse(sheet)
+        df = clean_df_columns(df)           # strip quotes + spaces from all col names
 
-    # ── AG: Messho Ag sheet ──
-    xl_ag = pd.ExcelFile(io.BytesIO(ag_bytes))
-    if 'Messho Ag' in xl_ag.sheet_names:
-        df = xl_ag.parse('Messho Ag')
-        mc = next((c for c in df.columns if 'MESSHO' in str(c).upper() or 'MEESHO' in str(c).upper()), None)
-        oc = next((c for c in df.columns if 'OMS' in str(c).upper()), None)
-        if mc and oc:
-            df[mc] = df[mc].astype(str).str.strip()
-            df[oc] = df[oc].astype(str).str.strip()
-            df = df.dropna(subset=[mc, oc])
-            df = df[df[mc] != 'nan']
-            result['AG'] = dict(zip(df[mc], df[oc]))
+        # Find source SKU column (Meesho/Seller SKU)
+        src_col = find_col(df, *src_kws)
+        # Find OMS SKU column
+        oms_col = find_col(df, *oms_kws)
+
+        if src_col is None or oms_col is None:
+            st.warning(f"⚠️ Could not find columns in sheet [{sheet}]. Found: {df.columns.tolist()}")
+            result[acct] = {}
+            continue
+
+        df = df[[src_col, oms_col]].dropna(subset=[src_col, oms_col])
+        df[src_col] = df[src_col].astype(str).str.strip()
+        df[oms_col] = df[oms_col].astype(str).str.strip()
+        df = df[df[src_col] != 'nan']
+        df = df[df[oms_col] != 'nan']
+
+        result[acct] = dict(zip(df[src_col], df[oms_col]))
 
     return result
 
 @st.cache_data(show_spinner=False)
 def load_pwn(file_bytes):
     # Row 3 = real header: OMS Parent SKU | OMS Child SKU | PWN+10%
-    # MUST use OMS Child SKU (col index 1), NOT Parent SKU (col index 0)
     df = pd.read_excel(io.BytesIO(file_bytes), header=2)
-    df.columns = [str(c).strip() for c in df.columns]
+    df = clean_df_columns(df)
 
-    child_col = next((c for c in df.columns if 'CHILD' in c.upper()), df.columns[1])
-    pwn_col   = next((c for c in df.columns if 'PWN'   in c.upper()), df.columns[2])
+    # Must use Child SKU (has sizes), NOT Parent SKU
+    child_col = find_col(df, 'CHILD')
+    pwn_col   = find_col(df, 'PWN')
+
+    if child_col is None:
+        child_col = df.columns[1]
+    if pwn_col is None:
+        pwn_col = df.columns[2]
 
     df = df[[child_col, pwn_col]].dropna(subset=[child_col, pwn_col])
     df[child_col] = df[child_col].astype(str).str.strip()
@@ -170,6 +187,7 @@ def load_closed_sku(file_bytes):
     def add_prices(sheet_name, sku_col_idx, price_col_idx):
         if sheet_name in xl.sheet_names:
             df = xl.parse(sheet_name, usecols=[sku_col_idx, price_col_idx])
+            df = clean_df_columns(df)
             df.columns = ['SKU', 'Price']
             df = df.dropna(subset=['SKU', 'Price'])
             df['SKU']   = df['SKU'].astype(str).str.strip()
@@ -184,54 +202,45 @@ def load_closed_sku(file_bytes):
     return {sku: min(prices) for sku, prices in closed.items() if prices}
 
 # ─────────────────────────────────────────────
-# FULL PWN LOOKUP WITH ALL FALLBACKS
+# PWN LOOKUP WITH ALL FALLBACKS
 # ─────────────────────────────────────────────
 def lookup_pwn(oms_sku, exact_map, ci_map):
-    """
-    Try every resolution in order:
-    1. Direct exact match
-    2. Case-insensitive match
-    3. Prefix replacements one by one
-    4. Split combined size (BASE-3XL-4XL → BASE-3XL)
-    5. Size-range match (BASE-L → BASE-L-XL)
-    Returns (price, matched_key, note) or (None, oms_sku, 'Not Found')
-    """
     def try_key(key, note):
         if key in exact_map:
             return exact_map[key], key, note
         if key.lower() in ci_map:
             orig_key, price = ci_map[key.lower()]
-            return price, orig_key, note + " (ci)"
+            return price, orig_key, note + ' (ci)'
         return None, None, None
 
     # 1. Direct
-    p, k, n = try_key(oms_sku, "Direct")
+    p, k, n = try_key(oms_sku, 'Direct')
     if p is not None: return p, k, n
 
     # 2. Prefix replacements
     for pattern, repl in PREFIX_REPLACEMENTS:
         candidate = re.sub(pattern, repl, oms_sku, count=1)
         if candidate != oms_sku:
-            p, k, n = try_key(candidate, f"Prefix: {pattern}→{repl}")
+            p, k, n = try_key(candidate, f'Prefix: {pattern}→{repl}')
             if p is not None: return p, k, n
 
-    # 3. Combined size split: BASE-3XL-4XL → try BASE-3XL, BASE-4XL
+    # 3. Combined size split: BASE-3XL-4XL → BASE-3XL, BASE-4XL
     m = re.match(r'^(.+)-([A-Z0-9]+)-([A-Z0-9]+)$', oms_sku)
     if m:
         base, s1, s2 = m.group(1), m.group(2), m.group(3)
         for sz in [s1, s2]:
-            p, k, n = try_key(f"{base}-{sz}", f"Split size: →{sz}")
+            p, k, n = try_key(f'{base}-{sz}', f'Split→{sz}')
             if p is not None: return p, k, n
 
-    # 4. Single size → size-range
+    # 4. Size range: BASE-L → BASE-L-XL
     m2 = re.match(r'^(.+)-([A-Z0-9]+)$', oms_sku)
     if m2:
         base, size = m2.group(1), m2.group(2)
         for range_sz in SIZE_RANGE_MAP.get(size, []):
-            p, k, n = try_key(f"{base}-{range_sz}", f"Size range: {size}→{range_sz}")
+            p, k, n = try_key(f'{base}-{range_sz}', f'Range: {size}→{range_sz}')
             if p is not None: return p, k, n
 
-    return None, oms_sku, "Not Found"
+    return None, oms_sku, 'Not Found'
 
 # ─────────────────────────────────────────────
 # PROCESS ONE CSV
@@ -254,25 +263,23 @@ def process_csv(df_raw, account_code, company_name, sku_map, exact_map, ci_map, 
         disc_price   = pd.to_numeric(row.get('Supplier Discounted Price (Incl GST and Commision)', 0), errors='coerce') or 0
         packet_id    = row.get('Packet Id', '')
 
-        # ── STEP 1: Build Meesho SKU (original) = raw_sku + "-" + size ──
-        size_clean   = size if size and size.lower() not in ('nan', '', 'none') else ''
-        meesho_sku   = f"{raw_sku}-{size_clean}" if size_clean else raw_sku
+        # STEP 1: Build Meesho SKU = raw_sku + "-" + size
+        size_clean      = size if size and size.lower() not in ('nan', '', 'none') else ''
+        meesho_sku      = f'{raw_sku}-{size_clean}' if size_clean else raw_sku
 
-        # ── STEP 2: Normalize size → OMS format for alternate lookup ──
-        size_norm        = normalize_size(size_clean) if size_clean else ''
-        meesho_sku_norm  = f"{raw_sku}-{size_norm}" if size_norm else raw_sku
+        # STEP 2: Normalize size → OMS format
+        size_norm       = normalize_size(size_clean) if size_clean else ''
+        meesho_sku_norm = f'{raw_sku}-{size_norm}' if size_norm else raw_sku
 
-        # ── STEP 3: Replace Meesho SKU → OMS SKU ──
-        # Try original first, then normalized size variant
+        # STEP 3: Replace Meesho SKU → OMS SKU via account replace map
         if meesho_sku in acct_sku_map:
             oms_sku = acct_sku_map[meesho_sku]
         elif meesho_sku_norm in acct_sku_map:
             oms_sku = acct_sku_map[meesho_sku_norm]
         else:
-            # Not in map — use normalized meesho sku as-is for PWN lookup
-            oms_sku = meesho_sku_norm
+            oms_sku = meesho_sku_norm   # not in map — use as-is
 
-        # ── STEP 4: Check Closed SKU list ──
+        # STEP 4: Check Closed SKU list
         sku_status   = 'On Going'
         pwn_10_price = None
         final_oms    = oms_sku
@@ -283,11 +290,11 @@ def process_csv(df_raw, account_code, company_name, sku_map, exact_map, ci_map, 
             pwn_10_price = closed_map[oms_sku]
             lookup_note  = 'Closed SKU'
         else:
-            # ── STEP 5: Full PWN lookup with all fallbacks ──
+            # STEP 5: Full PWN lookup with all fallbacks
             pwn_val, final_oms, lookup_note = lookup_pwn(oms_sku, exact_map, ci_map)
             pwn_10_price = pwn_val if pwn_val is not None else 'SKU Not Found'
 
-        # ── STEP 6: Calculate ──
+        # STEP 6: Calculate
         disc_price_qty = round(disc_price * qty, 2)
         if isinstance(pwn_10_price, (int, float)):
             pwn_10_qty = round(pwn_10_price * qty, 2)
@@ -465,14 +472,13 @@ with st.sidebar:
     st.markdown('---')
     st.markdown('### 🔄 SKU Resolution Steps')
     st.markdown("""
-    1. Build: SKU + `-` + Size = Meesho SKU
+    1. Build: `SKU + - + Size` = Meesho SKU
     2. Normalize: `Free-Size:36-40`→`F`, `XXXL`→`3XL`
-    3. Replace map (Meesho YG/PE/AG) → OMS SKU
-    4. Direct PWN lookup
-    5. Case-insensitive lookup
-    6. Prefix fix: `PLYK/YKN/YPLK`→`YK`
-    7. Split combined size: `3XL-4XL`→`3XL`
-    8. Size range: `L`→`L-XL`, `XXL`→`XXL-3XL`
+    3. Replace map (YG/PE/AG) → OMS SKU
+    4. Direct PWN lookup + case-insensitive
+    5. Prefix fix: `PLYK/YKN/YPLK`→`YK`
+    6. Split combined size: `3XL-4XL`→`3XL`
+    7. Size range: `L`→`L-XL`, `XXL`→`XXL-3XL`
     """)
 
 # ─────────────────────────────────────────────
@@ -494,33 +500,28 @@ if st.button('🚀 Run Reconciliation', type='primary', use_container_width=True
     if errors:
         st.error(f"Please upload: {', '.join(errors)}")
     else:
-        # ── READ ALL FILE BYTES UPFRONT ──
-        # Critical: read bytes once and store — avoids Streamlit cache
-        # consuming empty byte stream on re-runs
+        # Read all bytes ONCE upfront — avoids Streamlit cache empty-stream bug
         replace_bytes = ref_replace.read()
         pwn_bytes     = ref_pwn.read()
         closed_bytes  = ref_closed.read()
 
         with st.spinner('Loading reference files...'):
-            # Pass same bytes to all 3 account loaders
-            sku_map           = load_replace_sku(replace_bytes, replace_bytes, replace_bytes)
+            sku_map           = load_replace_sku(replace_bytes)
             exact_map, ci_map = load_pwn(pwn_bytes)
             closed_map        = load_closed_sku(closed_bytes)
 
-        # Show what was loaded — verify map sizes
         yg_size = len(sku_map.get('YG', {}))
         pe_size = len(sku_map.get('PE', {}))
         ag_size = len(sku_map.get('AG', {}))
 
         st.success(
-            f"✅ Reference loaded — "
-            f"**PWN: {len(exact_map):,} SKUs** | "
+            f"✅ Loaded — **PWN: {len(exact_map):,} SKUs** | "
             f"**Closed: {len(closed_map):,} SKUs** | "
-            f"Replace maps → YG: {yg_size:,} | PE: {pe_size:,} | AG: {ag_size:,}"
+            f"Replace → YG: {yg_size:,} | PE: {pe_size:,} | AG: {ag_size:,}"
         )
 
         if yg_size == 0 or pe_size == 0 or ag_size == 0:
-            st.warning("⚠️ One or more Replace SKU maps loaded empty! Check the Replace_SKU.xlsx file.")
+            st.warning('⚠️ One or more Replace SKU maps loaded empty! Check the Replace_SKU.xlsx file.')
 
         all_sheets = {}
         all_stats  = []
@@ -534,8 +535,7 @@ if st.button('🚀 Run Reconciliation', type='primary', use_container_width=True
             )
 
             try:
-                csv_bytes    = f.read()
-                df_raw       = pd.read_csv(io.BytesIO(csv_bytes))
+                df_raw       = pd.read_csv(io.BytesIO(f.read()))
                 total_input  = len(df_raw)
 
                 df_out = process_csv(
@@ -543,7 +543,7 @@ if st.button('🚀 Run Reconciliation', type='primary', use_container_width=True
                     sku_map, exact_map, ci_map, closed_map
                 )
                 total_output = len(df_out)
-                sheet_key    = f"{account_code}_{f.name[:25]}"
+                sheet_key    = f'{account_code}_{f.name[:25]}'
                 all_sheets[sheet_key] = df_out
 
                 diff_series = pd.to_numeric(df_out['Difference Amount'], errors='coerce')
@@ -555,9 +555,9 @@ if st.button('🚀 Run Reconciliation', type='primary', use_container_width=True
 
                 all_stats.append({
                     'account': account_code, 'company': company_name,
-                    'orders': total_output, 'profit': profit_cnt,
-                    'loss': loss_cnt, 'not_found': not_found,
-                    'closed': closed_cnt, 'total_diff': total_diff
+                    'orders': total_output,  'profit': profit_cnt,
+                    'loss': loss_cnt,        'not_found': not_found,
+                    'closed': closed_cnt,    'total_diff': total_diff
                 })
 
                 if total_input != total_output:
@@ -586,7 +586,7 @@ if st.button('🚀 Run Reconciliation', type='primary', use_container_width=True
                         ['Meesho SKU', 'OMS SKU', 'Final OMS SKU', 'Size', 'Lookup Note']
                     ].drop_duplicates()
                     with st.expander(f'⚠️ {not_found} SKU Not Found — click to inspect'):
-                        st.caption('These SKUs were not found after all fallback attempts. Add them to the PWN+10% file.')
+                        st.caption('These SKUs were not found after all fallback attempts. Add them to PWN+10% file.')
                         st.dataframe(nf_df, use_container_width=True)
 
                 with st.expander(f'👁️ Preview — {company_name} (first 20 rows)'):
@@ -599,7 +599,6 @@ if st.button('🚀 Run Reconciliation', type='primary', use_container_width=True
 
             progress.progress((i + 1) / len(order_files))
 
-        # Overall summary
         if all_stats:
             st.markdown('<div class="section-header">📊 Overall Summary</div>', unsafe_allow_html=True)
             grand_orders = sum(s['orders'] for s in all_stats)
