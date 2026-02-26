@@ -585,9 +585,95 @@ if st.button('🚀 Run Reconciliation', type='primary', use_container_width=True
                     nf_df = df_out[df_out['Difference Amount'] == 'SKU Not Found'][
                         ['Meesho SKU', 'OMS SKU', 'Final OMS SKU', 'Size', 'Lookup Note']
                     ].drop_duplicates()
-                    with st.expander(f'⚠️ {not_found} SKU Not Found — click to inspect'):
-                        st.caption('These SKUs were not found after all fallback attempts. Add them to PWN+10% file.')
+                    with st.expander(f'⚠️ {not_found} SKU Not Found — click to inspect & correct', expanded=True):
+                        st.caption('These SKUs were not found after all fallback attempts. You can correct the Final OMS SKU below to get the price in real time.')
                         st.dataframe(nf_df, use_container_width=True)
+
+                    # ── SKU CORRECTION UI ──────────────────────────────────
+                    st.markdown('<div class="section-header">✏️ Correct SKU Not Found</div>', unsafe_allow_html=True)
+                    st.caption('Enter the correct Final OMS SKU for each not-found SKU. Price will be fetched instantly from PWN+10% reference.')
+
+                    correction_key = f'corrections_{sheet_key}'
+                    if correction_key not in st.session_state:
+                        st.session_state[correction_key] = {}
+
+                    # Show one correction row per unique not-found Final OMS SKU
+                    unique_nf = nf_df['Final OMS SKU'].unique().tolist()
+
+                    for orig_sku in unique_nf:
+                        saved = st.session_state[correction_key].get(orig_sku, {})
+                        col_a, col_b, col_c, col_d = st.columns([3, 3, 2, 2])
+                        with col_a:
+                            st.text_input('Original SKU (not found)', value=orig_sku,
+                                          disabled=True, key=f'orig_{sheet_key}_{orig_sku}')
+                        with col_b:
+                            corrected = st.text_input(
+                                'Correct Final OMS SKU',
+                                value=saved.get('corrected_sku', ''),
+                                key=f'fix_{sheet_key}_{orig_sku}',
+                                placeholder='e.g. YK251-XL'
+                            )
+                        # Real-time price lookup
+                        looked_up_price = None
+                        looked_up_note  = ''
+                        if corrected.strip():
+                            looked_up_price, _, looked_up_note = lookup_pwn(corrected.strip(), exact_map, ci_map)
+                            # also try closed map
+                            if looked_up_price is None and corrected.strip() in closed_map:
+                                looked_up_price = closed_map[corrected.strip()]
+                                looked_up_note  = 'Closed SKU'
+                        with col_c:
+                            if corrected.strip():
+                                if looked_up_price is not None:
+                                    st.markdown(
+                                        f'<div style="margin-top:28px;padding:6px 10px;background:#e6f9ee;'
+                                        f'border-radius:6px;color:#1a8c4e;font-weight:600;font-size:0.95rem">'
+                                        f'₹{looked_up_price:,.2f} &nbsp;<span style="font-size:0.75rem;'
+                                        f'color:#777">{looked_up_note}</span></div>',
+                                        unsafe_allow_html=True
+                                    )
+                                else:
+                                    st.markdown(
+                                        '<div style="margin-top:28px;padding:6px 10px;background:#fff0f0;'
+                                        'border-radius:6px;color:#d93025;font-weight:600;font-size:0.95rem">'
+                                        '❌ Still Not Found</div>',
+                                        unsafe_allow_html=True
+                                    )
+                            else:
+                                st.markdown('<div style="margin-top:28px;color:#aaa;font-size:0.85rem">Enter SKU →</div>',
+                                            unsafe_allow_html=True)
+                        with col_d:
+                            apply_btn = st.button('✅ Apply', key=f'apply_{sheet_key}_{orig_sku}',
+                                                  disabled=(looked_up_price is None))
+                            if apply_btn and looked_up_price is not None:
+                                st.session_state[correction_key][orig_sku] = {
+                                    'corrected_sku': corrected.strip(),
+                                    'price':         looked_up_price,
+                                    'note':          looked_up_note,
+                                }
+                                st.toast(f'✅ Applied: {orig_sku} → {corrected.strip()} @ ₹{looked_up_price:,.2f}', icon='✅')
+
+                    # Apply all saved corrections to df_out in session state
+                    corrections = st.session_state[correction_key]
+                    if corrections:
+                        st.markdown(f'**{len(corrections)} correction(s) applied** — reflected in download below.')
+                        mask = df_out['Difference Amount'] == 'SKU Not Found'
+                        for orig_sku, fix in corrections.items():
+                            row_mask = mask & (df_out['Final OMS SKU'] == orig_sku)
+                            if row_mask.any():
+                                qty_col = df_out.loc[row_mask, 'Quantity']
+                                disc_col = df_out.loc[row_mask, 'Supplier Discounted Price']
+                                df_out.loc[row_mask, 'Final OMS SKU']        = fix['corrected_sku']
+                                df_out.loc[row_mask, 'Update PWN+10%']       = fix['price']
+                                df_out.loc[row_mask, 'Update PWN+10% * Qty'] = (disc_col * 0 + fix['price'] * qty_col).round(2)
+                                df_out.loc[row_mask, 'Supplier Discounted Price * Qty'] = (disc_col * qty_col).round(2)
+                                df_out.loc[row_mask, 'Difference Amount']    = (
+                                    disc_col * qty_col - fix['price'] * qty_col
+                                ).round(2)
+                                df_out.loc[row_mask, 'Lookup Note']          = fix['note'] + ' (corrected)'
+                        # Update the sheet in all_sheets so the Excel export picks it up
+                        all_sheets[sheet_key] = df_out
+                    # ── END SKU CORRECTION UI ──────────────────────────────
 
                 with st.expander(f'👁️ Preview — {company_name} (first 20 rows)'):
                     st.dataframe(df_out.head(20), use_container_width=True)
