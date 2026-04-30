@@ -85,14 +85,14 @@ SIZE_RANGE_MAP = {
 }
 
 PREFIX_REPLACEMENTS = [
-    (r'YKN',     'YK'),
-    (r'YKO251',  'YK251'),
-    (r'YPLK',    'YK'),
-    (r'PLYK',    'YK'),
-    (r'YKC',     'YK'),      # NEW: YKC → YK transformation
-    (r'YK-(\d)', r'YK\1'),
+    (r'PLYKN',   'YK'),      # PLYKN → YK (must come before PLYK)
+    (r'PLYK',    'YK'),      # PLYK → YK
+    (r'YPLK',    'YK'),      # YPLK → YK
+    (r'YKO251',  'YK251'),   # YKO251 → YK251
+    (r'YKN',     'YK'),      # YKN → YK
+    (r'YKC',     'YK'),      # YKC → YK
+    (r'YK-(\d)', r'YK\1'),   # YK-1 → YK1
 ]
-
 # ─────────────────────────────────────────────
 # LOAD REFERENCE FILES
 # ─────────────────────────────────────────────
