@@ -89,6 +89,7 @@ PREFIX_REPLACEMENTS = [
     (r'YKO251',  'YK251'),
     (r'YPLK',    'YK'),
     (r'PLYK',    'YK'),
+    (r'YKC',     'YK'),      # NEW: YKC → YK transformation
     (r'YK-(\d)', r'YK\1'),
 ]
 
