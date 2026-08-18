@@ -98,8 +98,10 @@ PREFIX_REPLACEMENTS = [
 # ─────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def load_replace_sku(file_bytes):
-    xl     = pd.ExcelFile(io.BytesIO(file_bytes))
-    result = {}
+    xl        = pd.ExcelFile(io.BytesIO(file_bytes))
+    result    = {}      # acct -> {exact SKU: OMS SKU}
+    result_ci = {}      # acct -> {lowercased SKU: (original SKU, OMS SKU)}
+    conflicts = {}       # acct -> [{'sku':..., 'options':[...], 'used':...}]
     sheet_config = {
         'Meesho YG':     ('YG',  ['SELLER', 'MEESHO', 'SKU'],  ['OMS']),
         'Meesho Pushpa': ('PE',  ['MESSHO', 'MEESHO', 'SKU'],  ['OMS']),
@@ -114,15 +116,29 @@ def load_replace_sku(file_bytes):
         oms_col = find_col(df, *oms_kws)
         if src_col is None or oms_col is None:
             st.warning(f"⚠️ Could not find columns in sheet [{sheet}]. Found: {df.columns.tolist()}")
-            result[acct] = {}
+            result[acct]    = {}
+            result_ci[acct] = {}
+            conflicts[acct] = []
             continue
         df = df[[src_col, oms_col]].dropna(subset=[src_col, oms_col])
         df[src_col] = df[src_col].astype(str).str.strip()
         df[oms_col] = df[oms_col].astype(str).str.strip()
         df = df[df[src_col] != 'nan']
         df = df[df[oms_col] != 'nan']
-        result[acct] = dict(zip(df[src_col], df[oms_col]))
-    return result
+
+        # Detect SKUs that map to more than one distinct OMS SKU (conflicting duplicates).
+        # Last occurrence in the sheet wins (matches previous behaviour) but we surface it.
+        acct_conflicts = []
+        grouped = df.groupby(src_col)[oms_col].agg(lambda s: list(dict.fromkeys(s)))
+        for sku, options in grouped.items():
+            if len(options) > 1:
+                acct_conflicts.append({'sku': sku, 'options': options, 'used': options[-1]})
+        conflicts[acct] = acct_conflicts
+
+        exact_map = dict(zip(df[src_col], df[oms_col]))
+        result[acct]    = exact_map
+        result_ci[acct] = {k.lower(): (k, v) for k, v in exact_map.items()}
+    return result, result_ci, conflicts
 
 @st.cache_data(show_spinner=False)
 def load_pwn(file_bytes):
@@ -201,9 +217,10 @@ def lookup_pwn(oms_sku, exact_map, ci_map):
 # ─────────────────────────────────────────────
 # PROCESS ONE CSV
 # ─────────────────────────────────────────────
-def process_csv(df_raw, account_code, company_name, sku_map, exact_map, ci_map, closed_map):
-    acct_sku_map = sku_map.get(account_code, {})
-    records      = []
+def process_csv(df_raw, account_code, company_name, sku_map, sku_ci_map, exact_map, ci_map, closed_map):
+    acct_sku_map    = sku_map.get(account_code, {})
+    acct_sku_ci_map = sku_ci_map.get(account_code, {})
+    records         = []
 
     for _, row in df_raw.iterrows():
         reason       = row.get('Reason for Credit Entry', '')
@@ -228,6 +245,10 @@ def process_csv(df_raw, account_code, company_name, sku_map, exact_map, ci_map, 
             oms_sku = acct_sku_map[meesho_sku]
         elif meesho_sku_norm in acct_sku_map:
             oms_sku = acct_sku_map[meesho_sku_norm]
+        elif meesho_sku.lower() in acct_sku_ci_map:
+            oms_sku = acct_sku_ci_map[meesho_sku.lower()][1]
+        elif meesho_sku_norm.lower() in acct_sku_ci_map:
+            oms_sku = acct_sku_ci_map[meesho_sku_norm.lower()][1]
         else:
             oms_sku = meesho_sku_norm
 
@@ -488,9 +509,9 @@ if st.button('🚀 Run Reconciliation', type='primary', use_container_width=True
         closed_bytes  = ref_closed.read()
 
         with st.spinner('Loading reference files...'):
-            sku_map           = load_replace_sku(replace_bytes)
-            exact_map, ci_map = load_pwn(pwn_bytes)
-            closed_map        = load_closed_sku(closed_bytes)
+            sku_map, sku_ci_map, sku_conflicts = load_replace_sku(replace_bytes)
+            exact_map, ci_map                  = load_pwn(pwn_bytes)
+            closed_map                         = load_closed_sku(closed_bytes)
 
         # Store reference maps in session state so correction UI can use them
         st.session_state.ref_maps = {
@@ -511,6 +532,27 @@ if st.button('🚀 Run Reconciliation', type='primary', use_container_width=True
         if yg_size == 0 or pe_size == 0 or ag_size == 0:
             st.warning('⚠️ One or more Replace SKU maps loaded empty! Check the Replace_SKU.xlsx file.')
 
+        # Warn about SKUs that map to more than one OMS SKU in Replace_SKU.xlsx —
+        # only the last row for each such SKU is actually used, which can look like
+        # "I added it but it's not replacing".
+        total_conflicts = sum(len(v) for v in sku_conflicts.values())
+        if total_conflicts:
+            with st.expander(
+                f'⚠️ {total_conflicts} Seller/Messho SKU(s) have conflicting OMS SKU mappings in Replace_SKU.xlsx — click to review',
+                expanded=False
+            ):
+                st.caption('Each SKU below appears more than once with a different OMS SKU. Only the "Used" value is currently applied.')
+                for acct, items in sku_conflicts.items():
+                    if not items:
+                        continue
+                    rows = [{
+                        'Account': acct,
+                        'Seller/Messho SKU': it['sku'],
+                        'Conflicting OMS SKUs': ' | '.join(it['options']),
+                        'Currently Used': it['used'],
+                    } for it in items]
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
         # Reset previous results
         st.session_state.raw_sheets  = {}
         st.session_state.corrections = {}
@@ -522,7 +564,7 @@ if st.button('🚀 Run Reconciliation', type='primary', use_container_width=True
             try:
                 df_raw    = pd.read_csv(io.BytesIO(f.read()))
                 df_out    = process_csv(df_raw, account_code, company_name,
-                                        sku_map, exact_map, ci_map, closed_map)
+                                        sku_map, sku_ci_map, exact_map, ci_map, closed_map)
                 sheet_key = f'{account_code}_{f.name[:25]}'
                 # Store original result — never mutate this
                 st.session_state.raw_sheets[sheet_key]  = df_out
