@@ -94,52 +94,45 @@ PREFIX_REPLACEMENTS = [
     (r'YK-(\d)', r'YK\1'),   # YK-1 → YK1
 ]
 # ─────────────────────────────────────────────
+# PWN LOOKUP WITH ALL FALLBACKS
+# ─────────────────────────────────────────────
+def lookup_pwn(oms_sku, exact_map, ci_map):
+    def try_key(key, note):
+        if key in exact_map:
+            return exact_map[key], key, note
+        if key.lower() in ci_map:
+            orig_key, price = ci_map[key.lower()]
+            return price, orig_key, note + ' (ci)'
+        return None, None, None
+
+    p, k, n = try_key(oms_sku, 'Direct')
+    if p is not None: return p, k, n
+
+    for pattern, repl in PREFIX_REPLACEMENTS:
+        candidate = re.sub(pattern, repl, oms_sku, count=1)
+        if candidate != oms_sku:
+            p, k, n = try_key(candidate, f'Prefix: {pattern}→{repl}')
+            if p is not None: return p, k, n
+
+    m = re.match(r'^(.+)-([A-Z0-9]+)-([A-Z0-9]+)$', oms_sku)
+    if m:
+        base, s1, s2 = m.group(1), m.group(2), m.group(3)
+        for sz in [s1, s2]:
+            p, k, n = try_key(f'{base}-{sz}', f'Split→{sz}')
+            if p is not None: return p, k, n
+
+    m2 = re.match(r'^(.+)-([A-Z0-9]+)$', oms_sku)
+    if m2:
+        base, size = m2.group(1), m2.group(2)
+        for range_sz in SIZE_RANGE_MAP.get(size, []):
+            p, k, n = try_key(f'{base}-{range_sz}', f'Range: {size}→{range_sz}')
+            if p is not None: return p, k, n
+
+    return None, oms_sku, 'Not Found'
+
+# ─────────────────────────────────────────────
 # LOAD REFERENCE FILES
 # ─────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def load_replace_sku(file_bytes):
-    xl        = pd.ExcelFile(io.BytesIO(file_bytes))
-    result    = {}      # acct -> {exact SKU: OMS SKU}
-    result_ci = {}      # acct -> {lowercased SKU: (original SKU, OMS SKU)}
-    conflicts = {}       # acct -> [{'sku':..., 'options':[...], 'used':...}]
-    sheet_config = {
-        'Meesho YG':     ('YG',  ['SELLER', 'MEESHO', 'SKU'],  ['OMS']),
-        'Meesho Pushpa': ('PE',  ['MESSHO', 'MEESHO', 'SKU'],  ['OMS']),
-        'Messho Ag':     ('AG',  ['MESSHO', 'MEESHO', 'SKU'],  ['OMS']),
-    }
-    for sheet, (acct, src_kws, oms_kws) in sheet_config.items():
-        if sheet not in xl.sheet_names:
-            continue
-        df = xl.parse(sheet)
-        df = clean_df_columns(df)
-        src_col = find_col(df, *src_kws)
-        oms_col = find_col(df, *oms_kws)
-        if src_col is None or oms_col is None:
-            st.warning(f"⚠️ Could not find columns in sheet [{sheet}]. Found: {df.columns.tolist()}")
-            result[acct]    = {}
-            result_ci[acct] = {}
-            conflicts[acct] = []
-            continue
-        df = df[[src_col, oms_col]].dropna(subset=[src_col, oms_col])
-        df[src_col] = df[src_col].astype(str).str.strip()
-        df[oms_col] = df[oms_col].astype(str).str.strip()
-        df = df[df[src_col] != 'nan']
-        df = df[df[oms_col] != 'nan']
-
-        # Detect SKUs that map to more than one distinct OMS SKU (conflicting duplicates).
-        # Last occurrence in the sheet wins (matches previous behaviour) but we surface it.
-        acct_conflicts = []
-        grouped = df.groupby(src_col)[oms_col].agg(lambda s: list(dict.fromkeys(s)))
-        for sku, options in grouped.items():
-            if len(options) > 1:
-                acct_conflicts.append({'sku': sku, 'options': options, 'used': options[-1]})
-        conflicts[acct] = acct_conflicts
-
-        exact_map = dict(zip(df[src_col], df[oms_col]))
-        result[acct]    = exact_map
-        result_ci[acct] = {k.lower(): (k, v) for k, v in exact_map.items()}
-    return result, result_ci, conflicts
-
 @st.cache_data(show_spinner=False)
 def load_pwn(file_bytes):
     df = pd.read_excel(io.BytesIO(file_bytes), header=2)
@@ -177,42 +170,80 @@ def load_closed_sku(file_bytes):
     add_prices('Sheet2', 0, 1)
     return {sku: min(prices) for sku, prices in closed.items() if prices}
 
-# ─────────────────────────────────────────────
-# PWN LOOKUP WITH ALL FALLBACKS
-# ─────────────────────────────────────────────
-def lookup_pwn(oms_sku, exact_map, ci_map):
-    def try_key(key, note):
-        if key in exact_map:
-            return exact_map[key], key, note
-        if key.lower() in ci_map:
-            orig_key, price = ci_map[key.lower()]
-            return price, orig_key, note + ' (ci)'
-        return None, None, None
+def _option_resolves(option, exact_map, ci_map, closed_map):
+    """Return True if this candidate OMS SKU actually has a findable price."""
+    if option in closed_map:
+        return True
+    price, _, _ = lookup_pwn(option, exact_map, ci_map)
+    return price is not None
 
-    p, k, n = try_key(oms_sku, 'Direct')
-    if p is not None: return p, k, n
+@st.cache_data(show_spinner=False)
+def load_replace_sku(file_bytes, pwn_bytes, closed_bytes):
+    # Load PWN + Closed first so we can auto-resolve conflicting SKU mappings
+    # by checking which candidate OMS SKU actually has a price.
+    exact_map, ci_map = load_pwn(pwn_bytes)
+    closed_map         = load_closed_sku(closed_bytes)
 
-    for pattern, repl in PREFIX_REPLACEMENTS:
-        candidate = re.sub(pattern, repl, oms_sku, count=1)
-        if candidate != oms_sku:
-            p, k, n = try_key(candidate, f'Prefix: {pattern}→{repl}')
-            if p is not None: return p, k, n
+    xl        = pd.ExcelFile(io.BytesIO(file_bytes))
+    result    = {}      # acct -> {exact SKU: OMS SKU}
+    result_ci = {}      # acct -> {lowercased SKU: (original SKU, OMS SKU)}
+    conflicts = {}       # acct -> [{'sku':..., 'options':[...], 'used':..., 'resolution':...}]
+    sheet_config = {
+        'Meesho YG':     ('YG',  ['SELLER', 'MEESHO', 'SKU'],  ['OMS']),
+        'Meesho Pushpa': ('PE',  ['MESSHO', 'MEESHO', 'SKU'],  ['OMS']),
+        'Messho Ag':     ('AG',  ['MESSHO', 'MEESHO', 'SKU'],  ['OMS']),
+    }
+    for sheet, (acct, src_kws, oms_kws) in sheet_config.items():
+        if sheet not in xl.sheet_names:
+            continue
+        df = xl.parse(sheet)
+        df = clean_df_columns(df)
+        src_col = find_col(df, *src_kws)
+        oms_col = find_col(df, *oms_kws)
+        if src_col is None or oms_col is None:
+            st.warning(f"⚠️ Could not find columns in sheet [{sheet}]. Found: {df.columns.tolist()}")
+            result[acct]    = {}
+            result_ci[acct] = {}
+            conflicts[acct] = []
+            continue
+        df = df[[src_col, oms_col]].dropna(subset=[src_col, oms_col])
+        df[src_col] = df[src_col].astype(str).str.strip()
+        df[oms_col] = df[oms_col].astype(str).str.strip()
+        df = df[df[src_col] != 'nan']
+        df = df[df[oms_col] != 'nan']
 
-    m = re.match(r'^(.+)-([A-Z0-9]+)-([A-Z0-9]+)$', oms_sku)
-    if m:
-        base, s1, s2 = m.group(1), m.group(2), m.group(3)
-        for sz in [s1, s2]:
-            p, k, n = try_key(f'{base}-{sz}', f'Split→{sz}')
-            if p is not None: return p, k, n
+        # Detect SKUs that map to more than one distinct OMS SKU (conflicting duplicates).
+        # For each conflicting SKU, try to auto-resolve by checking which candidate
+        # OMS SKU actually has a valid PWN/Closed price. If exactly one resolves,
+        # use that one. Otherwise fall back to "last occurrence wins" and flag it
+        # as needing manual review.
+        acct_conflicts = []
+        final_map_overrides = {}
+        grouped = df.groupby(src_col)[oms_col].agg(lambda s: list(dict.fromkeys(s)))
+        for sku, options in grouped.items():
+            if len(options) <= 1:
+                continue
+            resolvable = [opt for opt in options if _option_resolves(opt, exact_map, ci_map, closed_map)]
+            if len(resolvable) == 1:
+                chosen = resolvable[0]
+                status = 'Auto-resolved (matched PWN/Closed price)'
+            else:
+                chosen = options[-1]  # previous fallback behaviour
+                status = 'Unresolved — needs manual review' if len(resolvable) == 0 else 'Ambiguous (multiple options have valid prices) — needs manual review'
+            final_map_overrides[sku] = chosen
+            acct_conflicts.append({
+                'sku': sku, 'options': options, 'used': chosen, 'status': status,
+            })
+        conflicts[acct] = acct_conflicts
 
-    m2 = re.match(r'^(.+)-([A-Z0-9]+)$', oms_sku)
-    if m2:
-        base, size = m2.group(1), m2.group(2)
-        for range_sz in SIZE_RANGE_MAP.get(size, []):
-            p, k, n = try_key(f'{base}-{range_sz}', f'Range: {size}→{range_sz}')
-            if p is not None: return p, k, n
+        exact_map_sheet = dict(zip(df[src_col], df[oms_col]))
+        # Apply auto-resolution overrides (dict already reflects last-row-wins by
+        # default from zip(); only overwrite where we picked a different, resolvable option)
+        exact_map_sheet.update(final_map_overrides)
 
-    return None, oms_sku, 'Not Found'
+        result[acct]    = exact_map_sheet
+        result_ci[acct] = {k.lower(): (k, v) for k, v in exact_map_sheet.items()}
+    return result, result_ci, conflicts
 
 # ─────────────────────────────────────────────
 # PROCESS ONE CSV
@@ -465,6 +496,7 @@ with st.sidebar:
     1. Build: `SKU + - + Size` = Meesho SKU
     2. Normalize: `Free-Size:36-40`→`F`, `XXXL`→`3XL`
     3. Replace map (YG/PE/AG) → OMS SKU
+       *(conflicting duplicate SKUs are auto-resolved against the PWN/Closed files where possible)*
     4. Direct PWN lookup + case-insensitive
     5. Prefix fix: `PLYK/YKN/YPLK`→`YK`
     6. Split combined size: `3XL-4XL`→`3XL`
@@ -509,9 +541,9 @@ if st.button('🚀 Run Reconciliation', type='primary', use_container_width=True
         closed_bytes  = ref_closed.read()
 
         with st.spinner('Loading reference files...'):
-            sku_map, sku_ci_map, sku_conflicts = load_replace_sku(replace_bytes)
             exact_map, ci_map                  = load_pwn(pwn_bytes)
             closed_map                         = load_closed_sku(closed_bytes)
+            sku_map, sku_ci_map, sku_conflicts = load_replace_sku(replace_bytes, pwn_bytes, closed_bytes)
 
         # Store reference maps in session state so correction UI can use them
         st.session_state.ref_maps = {
@@ -532,16 +564,24 @@ if st.button('🚀 Run Reconciliation', type='primary', use_container_width=True
         if yg_size == 0 or pe_size == 0 or ag_size == 0:
             st.warning('⚠️ One or more Replace SKU maps loaded empty! Check the Replace_SKU.xlsx file.')
 
-        # Warn about SKUs that map to more than one OMS SKU in Replace_SKU.xlsx —
-        # only the last row for each such SKU is actually used, which can look like
-        # "I added it but it's not replacing".
-        total_conflicts = sum(len(v) for v in sku_conflicts.values())
+        # Warn about SKUs that map to more than one OMS SKU in Replace_SKU.xlsx.
+        # Auto-resolved ones are now handled automatically (matched against PWN/Closed
+        # prices); anything still ambiguous or unresolved needs a manual look.
+        total_conflicts   = sum(len(v) for v in sku_conflicts.values())
+        auto_resolved_cnt = sum(
+            1 for items in sku_conflicts.values() for it in items
+            if it['status'].startswith('Auto-resolved')
+        )
+        needs_review_cnt  = total_conflicts - auto_resolved_cnt
+
         if total_conflicts:
-            with st.expander(
-                f'⚠️ {total_conflicts} Seller/Messho SKU(s) have conflicting OMS SKU mappings in Replace_SKU.xlsx — click to review',
-                expanded=False
-            ):
-                st.caption('Each SKU below appears more than once with a different OMS SKU. Only the "Used" value is currently applied.')
+            label = f'⚠️ {total_conflicts} Seller/Messho SKU(s) had conflicting OMS SKU mappings — {auto_resolved_cnt} auto-resolved, {needs_review_cnt} need manual review'
+            with st.expander(label, expanded=(needs_review_cnt > 0)):
+                st.caption(
+                    '"Auto-resolved" means one of the two OMS SKUs actually had a valid PWN/Closed price and '
+                    'was used automatically. Rows marked "needs manual review" could not be told apart '
+                    'automatically — please check the Replace_SKU.xlsx file for these.'
+                )
                 for acct, items in sku_conflicts.items():
                     if not items:
                         continue
@@ -549,7 +589,8 @@ if st.button('🚀 Run Reconciliation', type='primary', use_container_width=True
                         'Account': acct,
                         'Seller/Messho SKU': it['sku'],
                         'Conflicting OMS SKUs': ' | '.join(it['options']),
-                        'Currently Used': it['used'],
+                        'Used': it['used'],
+                        'Status': it['status'],
                     } for it in items]
                     st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
